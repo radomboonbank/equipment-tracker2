@@ -1,0 +1,34 @@
+name: Publish GitHub Pages
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+concurrency:
+  group: pages
+  cancel-in-progress: true
+jobs:
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prepare public files
+        run: |
+          mkdir -p public/assets
+          cp assets/severity-criteria.webp public/assets/
+          cp member-backup.js thai-datetime.js gen-dispatch-events.js gen-dispatch-event-store.js edit-icons.js telegram-settings.js severity-record.js followup-now.js gen-dispatch.js gen-dispatch-reference.js public/
+          cp standby-seed.js standby-bridge.js standby.html standby.js idle-session.js construction-store.js time-pickers.js alarm-store.js date-pickers.js abnormal-drafts.js work-drafts.js presence.js index.html styles.css app.js members.js table-filters.js station-control.js dashboard.js firebase-config.js utils.js equipment-types.js login-history.js CROD_EGAT_Control_Center.ico online-users.png admin-559350.ico public/
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: public
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@v4
+

@@ -1,0 +1,344 @@
+rules_version = '2';
+service cloud.firestore {
+ match /databases/{database}/documents {
+  // Shared Standby contacts: public directory, edits restricted to King/Super Admin.
+  match /StandbyContacts/{id} {
+   allow read: if true;
+   allow create: if superAdmin() && standbyValid(id) && request.resource.data.revision == 1;
+   allow update: if superAdmin() && standbyValid(id)
+    && request.resource.data.revision == resource.data.revision + 1;
+   allow delete: if false;
+  }
+  function standbyText(v) { return v is string && v.size() <= 2000; }
+  function standbyValid(id) {
+   let d = request.resource.data;
+   let r = d.row;
+   return id.matches('g[0-5]-[0-9]{1,3}')
+    && d.keys().hasAll(['row','revision','updatedBy','updatedAt'])
+    && d.keys().hasOnly(['row','revision','updatedBy','updatedAt'])
+    && r is list && r.size() == 7
+    && standbyText(r[0]) && standbyText(r[1]) && standbyText(r[2])
+    && standbyText(r[3]) && standbyText(r[4]) && standbyText(r[5]) && standbyText(r[6])
+    && r[2].size() > 0 && (r[6] == '' || r[6] == '-' || r[6].matches('0[0-9]{9}') || r[2] == 'ว่าง')
+    && d.revision is int && d.revision > 0
+    && d.updatedBy == request.auth.uid && d.updatedAt == request.time;
+  }
+
+  function account() { return request.auth != null && exists(/databases/$(database)/documents/DatabaseLogin/$(request.auth.uid)); }
+  function role() { return get(/databases/$(database)/documents/DatabaseLogin/$(request.auth.uid)).data.role; }
+  function editor() { return account() && role() in ['admin', 'editor']; }
+  function admin() { return account() && role() == 'admin'; }
+  function superAdmin() { return admin() && get(/databases/$(database)/documents/DatabaseLogin/$(request.auth.uid)).data.get('duty', '') in ['super admin','king admin']; }
+  function kingAdmin() { return admin() && get(/databases/$(database)/documents/DatabaseLogin/$(request.auth.uid)).data.get('duty', '') == 'king admin'; }
+  function followup(v) {
+   return v is map && v.keys().hasOnly(['date','time','informant','mobile','details','follower'])
+    && v.date is string && v.time is string && v.informant is string && v.mobile is string && v.details is string && v.follower is string
+    && v.date.size() <= 10 && v.time.size() <= 5 && v.informant.size() <= 250 && v.mobile.size() <= 250 && v.details.size() <= 4000 && v.follower.size() <= 250;
+  }
+  function valid() {
+   let d = request.resource.data;
+   return d.code is string && d.equipment is string && d.station is string
+    && d.code.size() > 0 && d.code.size() <= 250  && d.equipment.size() <= 4000
+    && d.status in ['unreviewed', 'pending', 'repairing', 'resolved']
+    && d.priority in ['normal', 'urgent', 'critical'] && d.history is list
+    && d.revision is int && d.revision > 0
+    && d.followups is list && d.followups.size() == 3
+    && followup(d.followups[0]) && followup(d.followups[1]) && followup(d.followups[2])
+    && (!('eventType' in d) || d.eventType in ['','อุปกรณ์ขัดข้อง','Abnormal Alarm','Winding Temp Alarm','โครงการก่อสร้าง','งานบำรุงรักษาเกินกำหนด','ข้อจำกัด ระบบส่ง','Power Flow Control'])
+    && closure(d) && criticalityValid(d) && (!('repairPlan' in d) || repairPlanValid(d.repairPlan));
+  }
+  function repairPlanValid(p) {
+   return p is map && p.keys().hasAll(['approach','responsible','schedule','expectedDate'])
+    && p.keys().hasOnly(['approach','responsible','schedule','expectedDate','operatorName','operatorId','operatorMobile','expectedDateUnknown'])
+    && p.approach is string && p.responsible is string && p.schedule is string && p.expectedDate is string
+    && p.approach.size() <= 8000 && p.responsible.size() <= 4000 && p.schedule.size() <= 4000
+    && (!('operatorName' in p) || (p.operatorName is string && p.operatorName.size() <= 250))
+    && (!('operatorId' in p) || (p.operatorId is string && p.operatorId.size() <= 250))
+    && (!('operatorMobile' in p) || (p.operatorMobile is string && p.operatorMobile.size() <= 250))
+    && (!('expectedDateUnknown' in p) || (p.expectedDateUnknown is bool && (!p.expectedDateUnknown || p.expectedDate == '')))
+    && (p.expectedDate == '' || p.expectedDate.matches('[0-9]{4}-[0-9]{2}-[0-9]{2}'));
+  }
+  function criticalityValid(d) {
+   return !('criticality' in d) || (d.criticality in ['','high','medium','low']
+    && ('criticalityAssessment' in d ? assessmentValid(d) : true));
+  }
+  function assessmentValid(d) {
+   let a = d.criticalityAssessment;
+   return a is map && a.keys().hasAll(['scope','replacement','effect','measures'])
+    && a.keys().hasOnly(['scope','replacement','effect','measures'])
+    && a.scope is string && a.replacement is string && a.effect is string && a.measures is string
+    && a.scope.size() <= 4000 && a.replacement.size() <= 4000 && a.effect.size() <= 4000 && a.measures.size() <= 4000;
+  }
+  function closure(d) {
+   let c = d.closure;
+   return c is map && c.keys().hasOnly(['date','time','reporter','mobile','details','follower'])
+    && c.date is string && c.time is string && c.reporter is string && c.mobile is string && c.details is string && c.follower is string
+    && c.date.size() <= 10 && c.time.size() <= 5 && c.reporter.size() <= 250 && c.mobile.size() <= 250 && c.details.size() <= 4000 && c.follower.size() <= 250;
+  }
+  // Alarm forms: each section is stored independently; no public access.
+  match /AbnormalAlarm/{id} {
+   allow read: if account() && role() in ['admin','editor','viewer'];
+   allow create: if editor() && alarmValid() && request.resource.data.createdBy == request.auth.uid
+    && request.resource.data.createdAt == request.time && request.resource.data.revision == 1;
+   allow update: if editor() && alarmValid()
+    && request.resource.data.section == resource.data.section
+    && request.resource.data.createdBy == resource.data.createdBy
+    && request.resource.data.createdAt == resource.data.createdAt
+    && request.resource.data.revision == resource.data.revision + 1;
+   allow delete: if superAdmin() && id != '_schema';
+  }
+  function alarmValid() {
+   let d=request.resource.data;
+   let p=get(/databases/$(database)/documents/DatabaseLogin/$(request.auth.uid)).data;
+   return d.keys().hasAll(['schemaVersion','section','type','data','createdBy','createdAt','updatedBy','updatedByName','updatedByUsername','updatedAt','revision'])
+    && d.keys().hasOnly(['schemaVersion','section','type','data','createdBy','createdAt','updatedBy','updatedByName','updatedByUsername','updatedAt','revision'])
+    && d.schemaVersion == 1 && d.section in [1,2,3]
+    && ((d.section == 1 && d.type == 'general') || (d.section == 2 && d.type == 'bess') || (d.section == 3 && d.type == 'winding'))
+    && d.data is map && d.data.size() <= 400
+    && d.createdBy is string && d.createdAt is timestamp
+    && d.updatedBy == request.auth.uid && d.updatedAt == request.time
+    && d.updatedByName == p.get('displayName',p.username) && d.updatedByUsername == p.username
+    && d.revision is int && d.revision > 0;
+  }
+  match /GenDispatchEvents/{id} {
+   allow read: if account() && role() in ['admin','editor','viewer'];
+   allow create: if (id == '_schema' && superAdmin()
+     && request.resource.data.keys().hasAll(['schemaVersion','type','createdBy','createdAt'])
+     && request.resource.data.keys().hasOnly(['schemaVersion','type','createdBy','createdAt'])
+     && request.resource.data.schemaVersion == 1 && request.resource.data.type == 'gen-dispatch-events-schema'
+     && request.resource.data.createdBy == request.auth.uid && request.resource.data.createdAt == request.time)
+    || (id != '_schema' && editor() && genDispatchEventValid()
+     && request.resource.data.createdBy == request.auth.uid && request.resource.data.createdAt == request.time
+     && request.resource.data.revision == 1);
+   allow update: if id != '_schema' && editor() && genDispatchEventValid()
+    && (!('subEvents' in resource.data.data) || 'subEvents' in request.resource.data.data)
+    && request.resource.data.createdBy == resource.data.createdBy
+    && request.resource.data.createdAt == resource.data.createdAt
+    && request.resource.data.revision == resource.data.revision + 1;
+   allow delete: if id != '_schema' && superAdmin();
+  }
+  function genDispatchEventValid() {
+   let d=request.resource.data;
+   let v=d.data;
+   return d.keys().hasAll(['schemaVersion','type','data','revision','createdBy','createdAt','updatedBy','updatedAt'])
+    && d.keys().hasOnly(['schemaVersion','type','data','revision','createdBy','createdAt','updatedBy','updatedAt'])
+    && d.schemaVersion == 1 && d.type == 'gen-dispatch-event'
+    && v is map && v.keys().hasAll(['date','time','plant','event','reporter','phone'])
+    && v.keys().hasOnly(['date','time','plant','event','reporter','phone','subEvents'])
+    && (!('subEvents' in v) || genDispatchSubEventsValid(v.subEvents))
+    && v.date is string && v.date.matches('[0-9]{4}-[0-9]{2}-[0-9]{2}')
+    && v.time is string && v.time.matches('([01][0-9]|2[0-3]):[0-5][0-9]')
+    && v.plant is string && v.plant.size() > 0 && v.plant.size() <= 500
+    && v.event is string && v.event.size() > 0 && v.event.size() <= 4000
+    && v.reporter is string && v.reporter.size() <= 250
+    && v.phone is string && v.phone.size() <= 50
+    && d.createdBy is string && d.createdAt is timestamp
+    && d.updatedBy == request.auth.uid && d.updatedAt == request.time
+    && d.revision is int && d.revision > 0;
+  }
+
+  function genDispatchSubEventValid(v) {
+   return v is map && v.keys().hasAll(['id','date','time','plant','event','reporter','phone'])
+    && v.keys().hasOnly(['id','date','time','plant','event','reporter','phone'])
+    && v.id.matches('(?s).{1,100}')
+    && v.date.matches('[0-9]{4}-[0-9]{2}-[0-9]{2}')
+    && v.time.matches('([01][0-9]|2[0-3]):[0-5][0-9]')
+    && v.plant.matches('(?s).{1,500}') && v.event.matches('(?s).+') && v.event.size() <= 4000
+    && v.reporter.matches('(?s).{0,250}') && v.phone.matches('(?s).{0,50}');
+  }
+  function genDispatchSubEventsValid(rows) {
+   return rows is list && rows.size() <= 5
+    && (rows.size() <= 0 || genDispatchSubEventValid(rows[0]))
+    && (rows.size() <= 1 || genDispatchSubEventValid(rows[1]))
+    && (rows.size() <= 2 || genDispatchSubEventValid(rows[2]))
+    && (rows.size() <= 3 || genDispatchSubEventValid(rows[3]))
+    && (rows.size() <= 4 || genDispatchSubEventValid(rows[4]));
+  }
+
+  match /GenDispatch/{id} {
+   allow read: if true;
+   allow create: if superAdmin() && genDispatchReferenceValid()
+    && request.resource.data.createdBy == request.auth.uid
+    && request.resource.data.createdAt == request.time && request.resource.data.revision == 1;
+   allow update: if superAdmin() && genDispatchReferenceValid()
+    && (!('phone' in resource.data.data) || 'phone' in request.resource.data.data)
+    && (!('egatConnection' in resource.data.data) || 'egatConnection' in request.resource.data.data)
+    && (!('peaCenter' in resource.data.data) || 'peaCenter' in request.resource.data.data)
+    && request.resource.data.createdBy == resource.data.createdBy
+    && request.resource.data.createdAt == resource.data.createdAt
+    && request.resource.data.rowOrder == resource.data.rowOrder
+    && request.resource.data.revision == resource.data.revision + 1;
+   allow delete: if superAdmin();
+  }
+  function genDispatchReferenceValid() {
+   let d=request.resource.data;
+   let v=d.data;
+   return d.keys().hasAll(['schemaVersion','type','rowOrder','data','createdBy','createdAt','updatedBy','updatedAt','revision'])
+    && d.keys().hasOnly(['schemaVersion','type','rowOrder','data','createdBy','createdAt','updatedBy','updatedAt','revision'])
+    && d.schemaVersion == 2 && d.type == 'gen-dispatch'
+    && d.rowOrder is int && d.rowOrder > 0
+    && v is map && v.keys().hasAll(['date','region','code','plant','mw','connection','kvControl','note'])
+    && v.keys().hasOnly(['date','region','code','plant','mw','connection','kvControl','note','phone','egatConnection','peaCenter'])
+    && (!('peaCenter' in v) || (v.peaCenter is string && v.peaCenter.size() <= 100))
+    && (!('egatConnection' in v) || (v.egatConnection is string && v.egatConnection.size() <= 2000))
+    && (!('phone' in v) || (v.phone is string && v.phone.size() <= 250))
+    && v.date is string && v.date.size() <= 30
+    && v.region is string && v.region.size() <= 100
+    && v.code is string && v.code.size() <= 100
+    && v.plant is string && v.plant.size() <= 500
+    && (v.mw == null || (v.mw is number && v.mw >= 0))
+    && v.connection is string && v.connection.size() <= 2000
+    && v.kvControl in ['','มี','ไม่มี','On','Off','ยังไม่มี kV Control']
+    && v.note is string && v.note.size() <= 2000
+    && d.createdBy is string && d.createdAt is timestamp
+    && d.updatedBy == request.auth.uid && d.updatedAt == request.time
+    && d.revision is int && d.revision > 0;
+  }
+
+  match /ConstructionProjects/{id} {
+   allow read: if account() && role() in ['admin','editor','viewer'];
+   allow create: if editor() && constructionValid() && request.resource.data.createdBy == request.auth.uid
+    && request.resource.data.createdAt == request.time && request.resource.data.revision == 1;
+   allow update: if editor() && constructionValid()
+    && request.resource.data.createdBy == resource.data.createdBy
+    && request.resource.data.createdAt == resource.data.createdAt
+    && request.resource.data.revision == resource.data.revision + 1;
+   allow delete: if superAdmin() && id != '_schema';
+  }
+  function constructionValid() {
+   let d=request.resource.data;
+   let p=get(/databases/$(database)/documents/DatabaseLogin/$(request.auth.uid)).data;
+   return d.keys().hasAll(['schemaVersion','type','data','createdBy','createdAt','updatedBy','updatedByName','updatedByUsername','updatedAt','revision'])
+    && d.keys().hasOnly(['schemaVersion','type','data','createdBy','createdAt','updatedBy','updatedByName','updatedByUsername','updatedAt','revision'])
+    && d.schemaVersion == 1 && d.type == 'construction'
+    && d.data is map && d.data.size() <= 400
+    && d.createdBy is string && d.createdAt is timestamp
+    && d.updatedBy == request.auth.uid && d.updatedAt == request.time
+    && d.updatedByName == p.get('displayName',p.username) && d.updatedByUsername == p.username
+    && d.revision is int && d.revision > 0;
+  }
+  match /equipment/{id} {
+   allow read: if true;
+   allow create: if editor() && valid() && queued(id) && request.resource.data.id == id && request.resource.data.revision == 1;
+   allow update: if editor() && valid() && queued(id) && request.resource.data.id == resource.data.id && request.resource.data.code == resource.data.code && request.resource.data.revision == resource.data.revision + 1;
+   allow delete: if superAdmin();
+  }
+  match /DatabaseLogin/{uid} {
+   allow get: if (request.auth != null && request.auth.uid == uid) || superAdmin();
+   allow list: if superAdmin();
+   allow create, update, delete: if false;
+  }
+
+  // Public login counts contain no employee IDs, passwords, or role data.
+  match /publicLoginStats/{uid} {
+   allow get: if true;
+   allow list: if request.query.limit != null && request.query.limit <= 10;
+   allow create: if validLoginStat(uid) && request.resource.data.count == 1
+    && request.resource.data.firstLoginAt == request.time;
+   allow update: if validLoginStat(uid)
+    && request.resource.data.count == resource.data.count + 1
+    && request.resource.data.firstLoginAt == resource.data.firstLoginAt;
+   allow delete: if false;
+  }
+  function validLoginStat(uid) {
+   let d=request.resource.data;
+   return account() && request.auth.uid == uid && role() in ['admin','editor','viewer']
+    && d.keys().hasAll(['displayName','count','firstLoginAt','lastLoginAt'])
+    && d.keys().hasOnly(['displayName','count','firstLoginAt','lastLoginAt'])
+    && d.displayName == get(/databases/$(database)/documents/DatabaseLogin/$(request.auth.uid)).data.get('displayName', get(/databases/$(database)/documents/DatabaseLogin/$(request.auth.uid)).data.username)
+    && d.count is int && d.count > 0
+    && d.firstLoginAt is timestamp && d.lastLoginAt == request.time;
+  }
+
+  // Public projection contains only names and login times, never employee IDs or UIDs.
+  match /publicLoginHistory/{id} {
+   allow get: if id == 'recent';
+   allow list, delete: if false;
+   allow create: if id == 'recent' && validPublicLogin()
+    && request.resource.data.second == null && request.resource.data.third == null && request.resource.data.fourth == null && request.resource.data.fifth == null && request.resource.data.sixth == null && request.resource.data.seventh == null && request.resource.data.eighth == null && request.resource.data.ninth == null && request.resource.data.tenth == null;
+   allow update: if id == 'recent' && validPublicLogin()
+    && request.resource.data.second == resource.data.first && request.resource.data.third == resource.data.second && request.resource.data.fourth == resource.data.third && request.resource.data.fifth == resource.data.fourth && request.resource.data.sixth == resource.data.fifth && request.resource.data.seventh == resource.data.sixth && request.resource.data.eighth == resource.data.seventh && request.resource.data.ninth == resource.data.eighth && request.resource.data.tenth == resource.data.ninth;
+  }
+  function validPublicLogin() {
+   let d=request.resource.data;
+   return account() && role() in ['admin','editor','viewer']
+    && d.keys().hasAll(['first', 'second', 'third', 'fourth', 'fifth', 'sixth', 'seventh', 'eighth', 'ninth', 'tenth']) && d.keys().hasOnly(['first', 'second', 'third', 'fourth', 'fifth', 'sixth', 'seventh', 'eighth', 'ninth', 'tenth'])
+    && d.first is map && d.first.keys().hasAll(['displayName','at']) && d.first.keys().hasOnly(['displayName','at'])
+    && d.first.displayName == get(/databases/$(database)/documents/DatabaseLogin/$(request.auth.uid)).data.get('displayName', get(/databases/$(database)/documents/DatabaseLogin/$(request.auth.uid)).data.username)
+    && d.first.at == request.time;
+  }
+  match /loginHistory/{id} {
+   allow get: if account() && role() in ['admin','editor','viewer'] && id == 'recent';
+   allow list, delete: if false;
+   allow create: if account() && role() in ['admin','editor','viewer'] && id == 'recent' && validLogin()
+    && request.resource.data.second == null && request.resource.data.third == null;
+   allow update: if account() && role() in ['admin','editor','viewer'] && id == 'recent' && validLogin()
+    && request.resource.data.second == resource.data.first
+    && request.resource.data.third == resource.data.second;
+  }
+  function validLogin() {
+   let d = request.resource.data;
+   return d.keys().hasAll(['first','second','third']) && d.keys().hasOnly(['first','second','third'])
+    && d.first is map && d.first.keys().hasAll(['uid','username','at']) && d.first.keys().hasOnly(['uid','username','displayName','at'])
+    && d.first.uid == request.auth.uid
+    && d.first.username == get(/databases/$(database)/documents/DatabaseLogin/$(request.auth.uid)).data.username
+    && (!('displayName' in d.first) || d.first.displayName == get(/databases/$(database)/documents/DatabaseLogin/$(request.auth.uid)).data.get('displayName', d.first.username))
+    && d.first.at == request.time;
+  }
+
+  match /metadata/systemAssessment { allow get: if account(); }
+  match /metadata/telegramSending {
+   allow read: if editor();
+   allow create, update: if kingAdmin()
+    && request.resource.data.keys().hasAll(['enabled','updatedBy','updatedAt'])
+    && request.resource.data.keys().hasOnly(['enabled','updatedBy','updatedAt'])
+    && request.resource.data.enabled is bool
+    && request.resource.data.updatedBy == request.auth.uid
+    && request.resource.data.updatedAt == request.time;
+   allow delete: if false;
+  }
+  match /metadata/{id} { allow read: if editor(); allow write: if id != 'telegramSending' && admin(); }
+  // Presence is visible only to signed-in members; each session owns its write.
+  match /onlineSessions/{id} {
+   allow read: if account() && role() in ['admin','editor','viewer'];
+   allow create: if validPresence() && id.matches(request.auth.uid + '_.*');
+   allow update: if validPresence() && resource.data.uid == request.auth.uid;
+   allow delete: if request.auth != null && resource.data.uid == request.auth.uid;
+  }
+  function validPresence() {
+   let d=request.resource.data;
+   return account() && role() in ['admin','editor','viewer']
+    && d.keys().hasAll(['uid','displayName','lastSeen']) && d.keys().hasOnly(['uid','displayName','lastSeen'])
+    && d.uid == request.auth.uid
+    && d.displayName == get(/databases/$(database)/documents/DatabaseLogin/$(request.auth.uid)).data.get('displayName', get(/databases/$(database)/documents/DatabaseLogin/$(request.auth.uid)).data.username)
+    && d.lastSeen == request.time;
+  }
+  match /memberOperations/{id} {
+   allow get: if superAdmin() && resource.data.actor == request.auth.uid;
+   allow list, create, update, delete: if false;
+  }
+  match /members/{uid} { allow read, write: if false; }
+  match /telegramDeliveries/{id} { allow read, write: if false; }
+  function queued(id) {
+   let key = id + '__' + string(request.resource.data.revision);
+   let q = getAfter(/databases/$(database)/documents/telegramOutbox/$(key)).data;
+   return q.record == request.resource.data && q.createdBy == request.auth.uid && q.createdAt == request.time && q.status == 'pending';
+  }
+  match /telegramOutbox/{key} {
+   allow get: if editor() && resource.data.createdBy == request.auth.uid;
+   allow list, update, delete: if false;
+   allow create: if editor() && queueValid(key);
+  }
+  function queueValid(key) {
+   let q = request.resource.data;
+   let path = /databases/$(database)/documents/equipment/$(q.recordId);
+   return q.keys().hasOnly(['recordId','revision','record','createdBy','createdAt','readyAt','status','nextPart','attempts'])
+    && q.recordId is string && q.revision is int && q.record is map
+    && key == q.recordId + '__' + string(q.revision)
+    && q.createdBy == request.auth.uid && q.createdAt == request.time && q.readyAt == request.time
+    && q.status == 'pending' && q.nextPart == 0 && q.attempts == 0
+    && getAfter(path).data == q.record && q.record.revision == q.revision
+    && ((!exists(path) && q.revision == 1) || (exists(path) && get(path).data.revision + 1 == q.revision));
+  }
+ }
+}
